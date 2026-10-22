@@ -1,0 +1,91 @@
+name: Radxa A7A Tiny Qwen MoE Inference Fixture
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/radxa-a7a-arm64]
+    paths:
+      - .github/workflows/a7a-tiny-oracle.yml
+      - c/tools/make_qwen36_tiny.py
+      - c/tools/convert_qwen36.py
+      - c/qwen36.c
+
+permissions:
+  contents: read
+
+jobs:
+  tiny-qwen-fixture:
+    name: Generate & verify tiny Qwen MoE fixture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install tiny fixture generator dependencies
+        run: |
+          python -m pip install -r c/tools/oracle-requirements.txt
+          python - <<'PY'
+          import torch, transformers, safetensors
+          print("torch", torch.__version__, "transformers", transformers.__version__)
+          PY
+      - name: Generate upstream deterministic tiny MoE and oracle
+        run: |
+          set -euo pipefail
+          cd c
+          python3 tools/make_qwen36_tiny.py \
+            --out qwen36_tiny --ref-mode full \
+            --emit-ref qwen36_tiny/ref_full.json
+          python3 tools/convert_qwen36.py \
+            --model qwen36_tiny --out qwen36_tiny_c --ebits 8
+          test -f qwen36_tiny/ref_full.json
+          test -f qwen36_tiny_c/model-globals.safetensors
+          du -sh qwen36_tiny_c
+      - name: Verify exact token output against CPU oracle
+        run: |
+          set -euo pipefail
+          make -C c -j2 qwen36
+          for capacity in 1 2 8; do
+            echo "Testing cache capacity=${capacity}"
+            (cd c && COLI_NO_OMP_TUNE=1 COLI_DENSE_I8=0 \
+              SNAP=qwen36_tiny_c ./qwen36 "$capacity" 8 \
+              qwen36_tiny/ref_full.json)
+          done
+      - name: Pack converted weights and oracle only
+        run: |
+          set -euo pipefail
+          mkdir -p fixture/qwen36_tiny_c fixture/qwen36_tiny
+          cp -a c/qwen36_tiny_c/. fixture/qwen36_tiny_c/
+          cp c/qwen36_tiny/ref_full.json fixture/qwen36_tiny/ref_full.json
+          cat > fixture/README.txt <<'EOF'
+          This is a SYNTHETIC TINY TEST MODEL, not a human language chat model.
+          It has deterministic RANDOM weights and generates token IDs only.
+          It is the exact tiny Qwen3.6-MoE-shaped fixture from upstream Colibri CI.
+          Use the Linux ARM64 qwen36 binary previously built by GitHub Actions:
+              cd /dev/shm/lyco-colibri-a7a/runtime
+              COLI_DENSE_I8=0 COLI_NO_OMP_TUNE=1 \
+                SNAP=/dev/shm/lyco-colibri-a7a/fixture/qwen36_tiny_c \
+                ./qwen36 1 8 /dev/shm/lyco-colibri-a7a/fixture/qwen36_tiny/ref_full.json
+          Exit code zero means expected tokens match exactly.
+          This never tests OpenAI compatibility or production inference quality.
+          Source: https://github.com/JustVugg/colibri
+          EOF
+          cd fixture
+          find qwen36_tiny_c qwen36_tiny -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cd ..
+          tar -czf colibri-qwen36-tiny-fixture.tar.gz -C fixture .
+          sha256sum colibri-qwen36-tiny-fixture.tar.gz > colibri-qwen36-tiny-fixture.tar.gz.sha256
+          ls -lh colibri-qwen36-tiny-fixture.tar.gz
+      - name: Upload tiny fixture for Radxa validation
+        uses: actions/upload-artifact@v4
+        with:
+          name: colibri-qwen36-tiny-fixture
+          path: |
+            colibri-qwen36-tiny-fixture.tar.gz
+            colibri-qwen36-tiny-fixture.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
