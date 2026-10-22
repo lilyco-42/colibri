@@ -1,0 +1,101 @@
+name: Radxa A7A ARM64 CPU Build
+
+on:
+  push:
+    branches:
+      - feat/radxa-a7a-arm64
+    paths:
+      - .github/workflows/a7a-arm64.yml
+      - c/**
+      - Makefile
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: colibri-a7a-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-aarch64:
+    name: Build and package Linux AArch64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 55
+    steps:
+      - name: Checkout pinned fork revision
+        uses: actions/checkout@v4
+
+      - name: Install minimal CPU toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential python3 file binutils libgomp1
+          echo "Runner: $(uname -m)"
+          test "$(uname -m)" = "aarch64"
+          gcc --version | head -1
+
+      - name: Build portable ARMv8-A engine variants (no GPU toolkits)
+        run: |
+          set -euo pipefail
+          # Portable baseline avoids baking runner-specific -mcpu=native flags
+          # into a binary for the Allwinner A733.
+          make -C c -j2 ARCH=armv8-a colibri qwen36 qwen38 olmoe
+          for engine in colibri qwen36 qwen38 olmoe; do
+            test -s "c/$engine"
+            chmod +x "c/$engine"
+            file "c/$engine"
+            readelf -h "c/$engine" | grep -q 'Machine:.*AArch64'
+            if ldd "c/$engine" | grep -q 'not found'; then
+              echo "Missing shared library for $engine"
+              ldd "c/$engine"
+              exit 1
+            fi
+          done
+
+      - name: Stage complete command-line Python runtime
+        run: |
+          set -euo pipefail
+          mkdir -p package
+          install -m 0755 c/colibri c/qwen36 c/qwen38 c/olmoe package/
+          install -m 0755 c/coli package/coli
+          python3 c/tools/pack_python.py c package
+          install -m 0644 LICENSE NOTICE THIRD_PARTY_NOTICES.md package/
+          python3 -m py_compile package/openai_server.py package/coli
+          python3 package/coli --version
+          cat > package/RADXA-A7A-EXPERIMENT.txt <<'EOF'
+          Colibri CPU experiment for Linux AArch64 (portable ARMv8-A).
+          Compiled on GitHub Actions, NOT on Radxa.
+          Four engines: colibri, qwen36, qwen38, olmoe.
+          This package does NOT include model weights.
+          Current upstream Colibri is designed for MoE snapshots much larger
+          than a 4 GiB Radxa board can practically load. GGUF files from llama.cpp
+          are not compatible with its model container.
+          Do not run ./start-here.sh on a corrupt SD-card root filesystem:
+          it could download tens of gigabytes of weights.
+          First verify: python3 coli --version and ./qwen36 --help.
+          To deploy safely: unpack into an isolated folder; do not overwrite
+          a7a-llama or the production API. Keep a quick rollback.
+          EOF
+          printf 'upstream_commit=%s\nrunner=%s\narchitecture=aarch64\nflags=ARCH=armv8-a VK=0 CUDA=0\n' \
+            "$GITHUB_SHA" "$(uname -a)" > package/BUILD-INFO.txt
+          cd package
+          sha256sum colibri qwen36 qwen38 olmoe > SHA256SUMS
+
+      - name: Archive and verify
+        run: |
+          set -euo pipefail
+          tar -C package -czf colibri-a7a-linux-aarch64.tar.gz .
+          tar -tzf colibri-a7a-linux-aarch64.tar.gz | head -30
+          (cd package && sha256sum -c SHA256SUMS)
+          sha256sum colibri-a7a-linux-aarch64.tar.gz > colibri-a7a-linux-aarch64.tar.gz.sha256
+          ls -lh colibri-a7a-linux-aarch64.tar.gz
+
+      - name: Publish downloadable ARM64 build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: colibri-a7a-linux-aarch64
+          path: |
+            colibri-a7a-linux-aarch64.tar.gz
+            colibri-a7a-linux-aarch64.tar.gz.sha256
+          retention-days: 14
+          if-no-files-found: error
