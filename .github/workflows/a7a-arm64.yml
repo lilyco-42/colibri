@@ -19,8 +19,8 @@ concurrency:
 
 jobs:
   linux-aarch64:
-    name: Build and package Linux AArch64
-    runs-on: ubuntu-24.04-arm
+    name: Cross-compile Linux AArch64 on Ubuntu x86_64
+    runs-on: ubuntu-24.04
     timeout-minutes: 55
     steps:
       - name: Checkout pinned fork revision
@@ -29,25 +29,37 @@ jobs:
       - name: Install minimal CPU toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential python3 file binutils libgomp1
+          sudo apt-get install -y --no-install-recommends \
+            build-essential python3 file \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu libc6-dev-arm64-cross \
+            libgomp1-arm64-cross qemu-user
           echo "Runner: $(uname -m)"
-          test "$(uname -m)" = "aarch64"
-          gcc --version | head -1
+          test "$(uname -m)" = "x86_64"
+          aarch64-linux-gnu-gcc -dumpmachine
+          echo "Cross compiler: $(aarch64-linux-gnu-gcc --version | head -1)"
 
       - name: Build portable ARMv8-A engine variants (no GPU toolkits)
         run: |
           set -euo pipefail
           # Portable baseline avoids baking runner-specific -mcpu=native flags
           # into a binary for the Allwinner A733.
-          make -C c -j2 ARCH=armv8-a colibri qwen36 qwen38 olmoe
+          make -C c -j2 CC=aarch64-linux-gnu-gcc ARCH=armv8-a colibri qwen36 qwen38 olmoe
           for engine in colibri qwen36 qwen38 olmoe; do
             test -s "c/$engine"
             chmod +x "c/$engine"
             file "c/$engine"
-            readelf -h "c/$engine" | grep -q 'Machine:.*AArch64'
-            if ldd "c/$engine" | grep -q 'not found'; then
-              echo "Missing shared library for $engine"
-              ldd "c/$engine"
+            aarch64-linux-gnu-readelf -h "c/$engine" | grep -q 'Machine:.*AArch64'
+            aarch64-linux-gnu-readelf -d "c/$engine" | grep 'NEEDED' || true
+            # Run the actual ARM64 dynamic loader through qemu; lack of a model is expected.
+            status=0
+            timeout 12s qemu-aarch64 -L /usr/aarch64-linux-gnu "./c/$engine" --help >"/tmp/$engine-smoke.log" 2>&1 || status=$?
+            if [ "$status" -eq 124 ] || [ "$status" -ge 128 ]; then
+              echo "ARM64 engine loader smoke failed for $engine: $status"
+              tail -20 "/tmp/$engine-smoke.log"
+              exit 1
+            fi
+            if grep -qiE 'error while loading shared libraries|failed to load shared library' "/tmp/$engine-smoke.log"; then
+              cat "/tmp/$engine-smoke.log"
               exit 1
             fi
           done
@@ -76,7 +88,7 @@ jobs:
           To deploy safely: unpack into an isolated folder; do not overwrite
           a7a-llama or the production API. Keep a quick rollback.
           EOF
-          printf 'upstream_commit=%s\nrunner=%s\narchitecture=aarch64\nflags=ARCH=armv8-a VK=0 CUDA=0\n' \
+          printf 'upstream_commit=%s\nbuilder=%s\narchitecture=aarch64\nflags=CC=aarch64-linux-gnu-gcc ARCH=armv8-a VK=0 CUDA=0\n' \
             "$GITHUB_SHA" "$(uname -a)" > package/BUILD-INFO.txt
           cd package
           sha256sum colibri qwen36 qwen38 olmoe > SHA256SUMS
